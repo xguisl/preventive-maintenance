@@ -115,17 +115,28 @@ function plugin_preventivemaintenance_install() {
             `technician_id` int(10) UNSIGNED NOT NULL,
             `last_maintenance_date` date DEFAULT NULL,
             `next_maintenance_date` date NOT NULL,
+            `description` text COLLATE utf8mb4_unicode_ci DEFAULT NULL,
             `date_creation` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
             `date_mod` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             `maintenance_interval` int(11) NOT NULL DEFAULT '30',
+            `created_by` int(10) UNSIGNED NOT NULL DEFAULT '0',
             PRIMARY KEY (`id`),
             KEY `entities_id` (`entities_id`),
             KEY `is_recursive` (`is_recursive`),
             KEY `items_id` (`items_id`),
-            KEY `technician_id` (`technician_id`)
+            KEY `technician_id` (`technician_id`),
+            KEY `created_by` (`created_by`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
         
         $DB->queryOrDie($query, $DB->error());
+    } else {
+        // Adiciona campo created_by se não existir (para instalações existentes)
+        if (!$DB->fieldExists('glpi_plugin_preventivemaintenance_preventivemaintenances', 'created_by')) {
+            $query = "ALTER TABLE `glpi_plugin_preventivemaintenance_preventivemaintenances` 
+                      ADD COLUMN `created_by` int(10) UNSIGNED NOT NULL DEFAULT '0' AFTER `maintenance_interval`,
+                      ADD KEY `created_by` (`created_by`)";
+            $DB->queryOrDie($query, $DB->error());
+        }
     }
 
     // Tabela de tickets de manutenção

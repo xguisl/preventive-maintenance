@@ -67,6 +67,15 @@ Session::checkRight('plugin_preventivemaintenance', CREATE);
 // Conexão manual com o banco de dados
 // Manual database connection
 $DB = new DB();
+
+// Verifica e adiciona campo created_by se não existir
+if (!$DB->fieldExists('glpi_plugin_preventivemaintenance_preventivemaintenances', 'created_by')) {
+    $alter_query = "ALTER TABLE `glpi_plugin_preventivemaintenance_preventivemaintenances` 
+                    ADD COLUMN `created_by` int(10) UNSIGNED NOT NULL DEFAULT '0' AFTER `maintenance_interval`,
+                    ADD KEY `created_by` (`created_by`)";
+    $DB->query($alter_query);
+}
+
 $is_edit = isset($_GET['id']);
 $pm = new PluginPreventivemaintenancePreventivemaintenance();
 $item_data = [];
@@ -124,23 +133,85 @@ if (isset($_POST['add'])) {
             throw new Exception(__('Token de segurança ausente. Recarregue a página e tente novamente.'));
         }
 
-        // Validação da entidade
-        // Entity validation
+        // Entidade fixa: entidade raiz (id = 0)
+        // Fixed entity: root entity (id = 0)
+        $selected_entity_id = 0;
+
+        // Verifica se é criação em lote
+        $is_bulk = isset($_POST['bulk_create']) && $_POST['bulk_create'] == '1';
         
-        $selected_entity_id = (int)$_POST['entities_id'];
-        error_log("[ENTIDADE] Valor recebido: " . $selected_entity_id);
-        
-        if ($selected_entity_id < 0) {
-            throw new Exception(__('Selecione uma entidade válida.'));
+        if ($is_bulk) {
+            // Criação em lote: múltiplos computadores
+            $computer_ids = isset($_POST['items_id_bulk']) ? $_POST['items_id_bulk'] : [];
+            if (empty($computer_ids)) {
+                throw new Exception(__('Selecione pelo menos um computador.'));
+            }
+            
+            $success_count = 0;
+            $skipped_count = 0;
+            $error_count = 0;
+            
+            foreach ($computer_ids as $comp_id) {
+                $comp_id = (int)$comp_id;
+                $computer = new Computer();
+                if (!$computer->getFromDB($comp_id)) {
+                    $error_count++;
+                    continue;
+                }
+                if ($computer->fields['entities_id'] != $selected_entity_id) {
+                    $skipped_count++;
+                    continue;
+                }
+                
+                // Verifica se já existe manutenção
+                $existing = $pm->find(['items_id' => $comp_id, 'itemtype' => 'Computer']);
+                if (count($existing) > 0) {
+                    $skipped_count++;
+                    continue;
+                }
+                
+                // Calcula intervalo
+                $maintenance_interval = 30;
+                $last_date = !empty($_POST['last_maintenance_date']) ? $_POST['last_maintenance_date'] : null;
+                $next_date = $_POST['next_maintenance_date'];
+                if (!empty($last_date) && !empty($next_date)) {
+                    $last_dt = new DateTime($last_date);
+                    $next_dt = new DateTime($next_date);
+                    $maintenance_interval = $last_dt->diff($next_dt)->days;
+                }
+                
+                $query = "INSERT INTO glpi_plugin_preventivemaintenance_preventivemaintenances
+                         (name, entities_id, is_recursive, technician_id, items_id, itemtype, 
+                          last_maintenance_date, next_maintenance_date, description, maintenance_interval, created_by)
+                          VALUES (
+                          '".$DB->escape($_POST['name'] ?? '')."',
+                          ".(int)$selected_entity_id.",
+                          0,
+                          ".(int)($_POST['technician_id'] ?? 0).",
+                          $comp_id,
+                          'Computer',
+                          ".(!empty($last_date) ? "'".$DB->escape($last_date)."'" : "NULL").",
+                          '".$DB->escape($next_date)."',
+                          ".(!empty($_POST['description']) ? "'".$DB->escape($_POST['description'])."'" : "NULL").",
+                          ".(int)$maintenance_interval.",
+                          ".(int)Session::getLoginUserID().")";
+                
+                $result = $DB->query($query);
+                if ($result) {
+                    $success_count++;
+                } else {
+                    error_log("[ERRO BULK] Query falhou para computador ID $comp_id: " . $DB->error());
+                    $error_count++;
+                }
+            }
+            
+            $msg = sprintf(__('Manutenções criadas: %d | Puladas (já existem): %d | Erros: %d'), $success_count, $skipped_count, $error_count);
+            Session::addMessageAfterRedirect($msg, $error_count > 0 ? false : true, $error_count > 0 ? WARNING : INFO);
+            Html::redirect('preventivemaintenance.php');
         }
 
-        $entity = new Entity();
-        if (!$entity->getFromDB($selected_entity_id)) {
-            throw new Exception(__('A entidade selecionada não existe no sistema.'));
-        }
-
-        // Validação do computador
-        // Computer validation
+        // Validação do computador (criação individual)
+        // Computer validation (single creation)
         if (!isset($_POST['items_id']) || empty($_POST['items_id'])) {
             throw new Exception(__('Selecione um computador válido.'));
         }
@@ -151,10 +222,10 @@ if (isset($_POST['add'])) {
             throw new Exception(__('Computador selecionado não encontrado.'));
         }
 
-        // Verifica se o computador pertence à entidade
-        // Checks if computer belongs to entity
+        // Verifica se o computador pertence à entidade raiz (id = 0)
+        // Checks if computer belongs to root entity (id = 0)
         if ($computer->fields['entities_id'] != $selected_entity_id) {
-            throw new Exception(__('O computador selecionado não pertence à entidade escolhida.'));
+            throw new Exception(__('O computador selecionado não pertence à entidade raiz.') . ' PC entity: ' . $computer->fields['entities_id'] . ', Expected: ' . $selected_entity_id);
         }
 
         // Verifica se já existe manutenção para este computador
@@ -187,7 +258,9 @@ if (isset($_POST['add'])) {
             'itemtype' => 'Computer',
             'last_maintenance_date' => $_POST['last_maintenance_date'] ?? null,
             'next_maintenance_date' => $_POST['next_maintenance_date'],
-            'maintenance_interval' => 30
+            'description' => $_POST['description'] ?? '',
+            'maintenance_interval' => 30,
+            'created_by' => Session::getLoginUserID()
         ];
 
         // Cálculo do intervalo de manutenção
@@ -217,15 +290,48 @@ if (isset($_POST['add'])) {
                       itemtype = 'Computer',
                       last_maintenance_date = ".(!empty($input['last_maintenance_date']) ? "'".$DB->escape($input['last_maintenance_date'])."'" : "NULL").",
                       next_maintenance_date = '".$DB->escape($input['next_maintenance_date'])."',
-                      maintenance_interval = ".(int)$input['maintenance_interval']."
+                      description = ".(!empty($input['description']) ? "'".$DB->escape($input['description'])."'" : "NULL").",
+                      maintenance_interval = ".(int)$input['maintenance_interval'].",
+                      created_by = ".(int)$input['created_by']."
                       WHERE id = ".(int)$input['id'];
             
             error_log("[QUERY] Update: " . $query);
             $result = $DB->query($query);
             
             if (!$result) {
-                error_log("[ERRO] Query falhou: " . $DB->error());
-                throw new Exception(__('Erro ao atualizar no banco de dados.'));
+                $db_error = $DB->error();
+                error_log("[ERRO] Query falhou: " . $db_error);
+                throw new Exception(__('Erro ao atualizar no banco de dados: ') . $db_error);
+            }
+            
+            // Atualiza o conteúdo do ticket aberto se existir
+            // Updates the open ticket content if it exists
+            $computer = new Computer();
+            $computer_name = '';
+            if ($computer->getFromDB($computer_id)) {
+                $computer_name = $computer->getName();
+            }
+            
+            $ticket_query = "SELECT t.id 
+                             FROM glpi_tickets t
+                             INNER JOIN glpi_items_tickets it ON it.tickets_id = t.id
+                             WHERE it.items_id = " . (int)$computer_id . "
+                             AND it.itemtype = 'Computer'
+                             AND t.name LIKE '%" . $DB->escape($input['name']) . "%'
+                             AND t.status NOT IN (6, 5)
+                             LIMIT 1";
+            $ticket_result = $DB->query($ticket_query);
+            if ($ticket_result && $ticket_result->num_rows > 0) {
+                $ticket_data = $ticket_result->fetch_assoc();
+                $ticket_id = $ticket_data['id'];
+                
+                $new_content = sprintf('O computador %s requer manutenção preventiva para: %s', $computer_name, $input['name']);
+                if (!empty($input['description'])) {
+                    $new_content .= "<br><br><strong>Descrição:</strong><br>" . nl2br(htmlspecialchars($input['description']));
+                }
+                
+                $update_ticket = "UPDATE glpi_tickets SET content = '" . $DB->escape($new_content) . "' WHERE id = " . (int)$ticket_id;
+                $DB->query($update_ticket);
             }
             
             Session::addMessageAfterRedirect(__('Manutenção atualizada com sucesso!'), true, INFO);
@@ -234,7 +340,7 @@ if (isset($_POST['add'])) {
             // Manual insert
             $query = "INSERT INTO glpi_plugin_preventivemaintenance_preventivemaintenances
                      (name, entities_id, is_recursive, technician_id, items_id, itemtype, 
-                      last_maintenance_date, next_maintenance_date, maintenance_interval)
+                      last_maintenance_date, next_maintenance_date, description, maintenance_interval, created_by)
                       VALUES (
                       '".$DB->escape($input['name'])."',
                       ".(int)$input['entities_id'].",
@@ -244,15 +350,18 @@ if (isset($_POST['add'])) {
                       'Computer',
                       ".(!empty($input['last_maintenance_date']) ? "'".$DB->escape($input['last_maintenance_date'])."'" : "NULL").",
                       '".$DB->escape($input['next_maintenance_date'])."',
-                      ".(int)$input['maintenance_interval']."
+                      ".(!empty($input['description']) ? "'".$DB->escape($input['description'])."'" : "NULL").",
+                      ".(int)$input['maintenance_interval'].",
+                      ".(int)$input['created_by']."
                       )";
             
             error_log("[QUERY] Insert: " . $query);
             $result = $DB->query($query);
             
             if (!$result) {
-                error_log("[ERRO] Query falhou: " . $DB->error());
-                throw new Exception(__('Erro ao gravar no banco de dados.'));
+                $db_error = $DB->error();
+                error_log("[ERRO] Query falhou: " . $db_error);
+                throw new Exception(__('Erro ao gravar no banco de dados: ') . $db_error);
             }
             
             Session::addMessageAfterRedirect(__('Manutenção criada com sucesso!'), true, INFO);
@@ -276,13 +385,15 @@ if (isset($_POST['save_selected_profiles'])) {
 
 // Configuração do formulário
 // Form configuration
-$entity = new Entity();
-// Busca apenas as entidades ativas da sessão do usuário
-// Finds only active entities from user session
-$entities = $entity->find(['id' => $_SESSION['glpiactiveentities']], 'completename ASC');
+// Entidade raiz fixa (id = 0)
+// Fixed root entity (id = 0)
+$root_entity_id = 0;
+$root_entity_name = 'Entidade Raiz';
 
 $computer = new Computer();
-$all_computers = $computer->find(['is_deleted' => 0], "name ASC");
+// Busca computadores apenas da entidade raiz (id = 0)
+// Finds computers only from root entity (id = 0)
+$all_computers = $computer->find(['is_deleted' => 0, 'entities_id' => $root_entity_id], "name ASC");
 
 $existing_maintenances = $pm->find(['itemtype' => 'Computer']);
 $blocked_computers = [];
@@ -315,10 +426,6 @@ Html::header(
 <style>
     body {
         background-color: #cacccf !important;
-    }
-    
-    #step2 {
-        display: none;
     }
     .form-section {
         margin-bottom: 15px;
@@ -514,47 +621,21 @@ Html::header(
             <form method='post' id='preventive_maintenance_form'>
                 <?php echo Html::hidden('_glpi_csrf_token', ['value' => $token]); ?>
                 <input type='hidden' name='add' value='1'>
+                <input type='hidden' name='entities_id' value='<?php echo $root_entity_id; ?>'>
                 
-                <!-- STEP 1 - Somente seleção da entidade -->
-                <!-- STEP 1 - Only entity selection -->
-                <div id='step1'>
-                    <!-- Botão para selecionar perfis técnicos -->
-                    <!-- Button to select technician profiles -->
-                    <div class="select-profile-btn">
-                        <button type="button" id="selectProfilesBtn" class="btn btn-info">
-                            <i class="fas fa-user-cog me-2"></i><?php echo __('Selecionar Perfis Técnicos'); ?>
-                        </button>
-                        <small class="text-muted d-block mt-1"><?php echo __('Perfis selecionados: ') . implode(', ', $selected_profiles); ?></small>
-                    </div>
-                    
-                    <div class='form-section'>
-                        <label for='entities_id_select'><?php echo __('Entidade'); ?> <span class='required'>*</span></label>
-                        <select name='entities_id_select' id='entities_id_select' class='form-select' required>
-                            <option value=''><?php echo __('Selecione uma entidade'); ?></option>
-                            <?php foreach ($entities as $ent) {
-                                $selected = ($is_edit && $item_data['entities_id'] == $ent['id']) ? 'selected' : '';
-                                echo "<option value='{$ent['id']}' $selected>{$ent['completename']}</option>";
-                            } ?>
-                        </select>
-                    </div>
-                    
-                    <div class='d-flex justify-content-end mt-4'>
-                        <button type='button' class='btn btn-primary' id='nextButton'>
-                            <i class='fas fa-arrow-right me-2'></i><?php echo __('Próximo'); ?>
-                        </button>
-                    </div>
+                <!-- Botão para selecionar perfis técnicos -->
+                <!-- Button to select technician profiles -->
+                <div class="select-profile-btn" style="margin-bottom: 20px;">
+                    <button type="button" id="selectProfilesBtn" class="btn btn-info">
+                        <i class="fas fa-user-cog me-2"></i><?php echo __('Selecionar Perfis Técnicos'); ?>
+                    </button>
+                    <small class="text-muted d-block mt-1"><?php echo __('Perfis selecionados: ') . implode(', ', $selected_profiles); ?></small>
                 </div>
                 
-                <!-- STEP 2 - Demais campos -->
-                <!-- STEP 2 - Other fields -->
-                <div id='step2'>
-                    <input type='hidden' name='entities_id' id='entities_id' value='<?php echo $is_edit ? $item_data['entities_id'] : ''; ?>'>
-                    
-                    <div class='entity-info'>
-                        <strong><?php echo __('Entidade selecionada:'); ?></strong>
-                        <span id='selected-entity-name'></span>
-                        (ID: <span id='selected-entity-id'></span>)
-                    </div>
+                <div class='entity-info' style="margin-bottom: 15px; padding: 10px; background: #e8f4fd; border-radius: 5px;">
+                    <strong><?php echo __('Entidade:'); ?></strong>
+                    <?php echo $root_entity_name; ?> (ID: <?php echo $root_entity_id; ?>)
+                </div>
                     
                     <div class='form-section'>
                         <label for='name'><?php echo __('Nome da Manutenção'); ?> <span class='required'>*</span></label>
@@ -575,18 +656,66 @@ Html::header(
                         </select>
                     </div>
                     
+                    <?php if ($is_edit): ?>
                     <div class='form-section'>
                         <label for='items_id'><?php echo __('Computador'); ?> <span class='required'>*</span></label>
                         <select name='items_id' id='items_id' class='form-select' required>
                             <option value=''><?php echo __('Selecione um computador'); ?></option>
                             <?php 
-                            if ($is_edit) {
-                                $computer->getFromDB($item_data['items_id']);
-                                echo "<option value='{$item_data['items_id']}' selected>{$computer->getName()}</option>";
+                            $computer->getFromDB($item_data['items_id']);
+                            echo "<option value='{$item_data['items_id']}' selected>{$computer->getName()}</option>";
+                            ?>
+                        </select>
+                    </div>
+                    <?php else: ?>
+                    <div class='form-section'>
+                        <label>
+                            <input type='checkbox' id='bulkModeToggle' onchange='toggleBulkMode()' checked> 
+                            <strong><?php echo __('Criar para múltiplos computadores'); ?></strong>
+                        </label>
+                    </div>
+                    
+                    <!-- Modo Bulk: checkboxes -->
+                    <div id='bulkModeSection' class='form-section'>
+                        <div style="margin-bottom: 10px; display: flex; gap: 10px; align-items: center;">
+                            <button type='button' class='btn btn-sm btn-outline-primary' onclick='toggleSelectAll(true)'>
+                                <i class='fas fa-check-double'></i> Selecionar Todos
+                            </button>
+                            <button type='button' class='btn btn-sm btn-outline-secondary' onclick='toggleSelectAll(false)'>
+                                <i class='fas fa-times'></i> Desmarcar Todos
+                            </button>
+                            <span class='text-muted' id='selectedCount'>0 selecionado(s)</span>
+                        </div>
+                        <div style='max-height: 300px; overflow-y: auto; border: 1px solid #ced4da; border-radius: 4px; padding: 10px; background: #f8f9fa;'>
+                            <?php foreach ($available_computers as $comp): ?>
+                            <div style='margin-bottom: 4px;'>
+                                <label style='cursor: pointer;'>
+                                    <input type='checkbox' name='items_id_bulk[]' value='<?php echo $comp['id']; ?>' 
+                                           class='bulk-computer-checkbox' onchange='updateSelectedCount()'>
+                                    <?php echo htmlspecialchars($comp['name']); ?>
+                                </label>
+                            </div>
+                            <?php endforeach; ?>
+                            <?php if (empty($available_computers)): ?>
+                            <p class='text-muted'><?php echo __('Nenhum computador disponível (todos já possuem manutenção)'); ?></p>
+                            <?php endif; ?>
+                        </div>
+                        <input type='hidden' name='bulk_create' id='bulkCreateInput' value='1'>
+                    </div>
+                    
+                    <!-- Modo Individual: select -->
+                    <div id='singleModeSection' class='form-section' style='display: none;'>
+                        <label for='items_id'><?php echo __('Computador'); ?> <span class='required'>*</span></label>
+                        <select name='items_id' id='items_id' class='form-select'>
+                            <option value=''><?php echo __('Selecione um computador'); ?></option>
+                            <?php 
+                            foreach ($available_computers as $comp) {
+                                echo "<option value='{$comp['id']}'>" . htmlspecialchars($comp['name']) . "</option>";
                             }
                             ?>
                         </select>
                     </div>
+                    <?php endif; ?>
                     
                     <div class='form-section'>
                         <label for='last_maintenance_date'><?php echo __('Última Manutenção'); ?></label>
@@ -602,15 +731,17 @@ Html::header(
                                class='form-control interval-field' required>
                     </div>
                     
-                    <div class='d-flex justify-content-between mt-4'>
-                        <button type='button' class='btn btn-secondary' id='backButton'>
-                            <i class='fas fa-arrow-left me-2'></i><?php echo __('Voltar'); ?>
-                        </button>
+                    <div class='form-section'>
+                        <label for='description'><?php echo __('Descrição'); ?></label>
+                        <textarea id='description' name='description' class='form-control' rows='4'
+                                  placeholder='<?php echo __('Detalhes adicionais sobre esta manutenção (opcional)'); ?>'><?php echo $is_edit ? htmlspecialchars($item_data['description'] ?? '') : ''; ?></textarea>
+                    </div>
+                    
+                    <div class='d-flex justify-content-end mt-4'>
                         <button type='submit' class='btn btn-success'>
                             <i class='fas fa-save me-2'></i><?php echo $is_edit ? __('Atualizar') : __('Salvar'); ?>
                         </button>
                     </div>
-                </div>
             </form>
             
             <!-- Modal para seleção de perfis técnicos -->
@@ -780,46 +911,9 @@ Html::header(
                     }
                 });
 
-                <?php if ($is_edit) { ?>
-                    // Se estiver editando, configura os valores iniciais
-                    // If editing, sets initial values
-                    const entityId = <?php echo $item_data['entities_id']; ?>;
-                    const entityName = $(`#entities_id_select option[value='${entityId}']`).text();
-                    
-                    $('#entities_id').val(entityId);
-                    $('#selected-entity-name').text('Entidade: ' + entityName);
-                    $('#selected-entity-id').text(entityId);
-                    
-                    $('#step1').hide();
-                    $('#step2').show();
-                <?php } ?>
-                
-                // Evento do botão Próximo
-                // Next button event
-                $('#nextButton').click(function() {
-                    if (!$('#entities_id_select').val()) {
-                        alert('<?php echo __("Selecione uma entidade"); ?>');
-                        return;
-                    }
-                    
-                    const entityId = $('#entities_id_select').val();
-                    const entityName = $('#entities_id_select option:selected').text();
-                    
-                    $('#entities_id').val(entityId);
-                    $('#selected-entity-name').text('Entidade: ' + entityName);
-                    $('#selected-entity-id').text(entityId);
-                    loadComputers(entityId);
-                    
-                    $('#step1').hide();
-                    $('#step2').show();
-                });
-                
-                // Evento do botão Voltar
-                // Back button event
-                $('#backButton').click(function() {
-                    $('#step2').hide();
-                    $('#step1').show();
-                });
+                // Carrega computadores da entidade raiz
+                // Loads computers from root entity
+                loadComputers(<?php echo $root_entity_id; ?>);
                 
                 // Carrega os computadores disponíveis para a entidade selecionada
                 // Loads available computers for selected entity
@@ -903,6 +997,40 @@ Html::header(
                     });
                 });
             });
+            
+            // Funções do modo Bulk
+            function toggleBulkMode() {
+                var bulkToggle = document.getElementById('bulkModeToggle');
+                var bulkSection = document.getElementById('bulkModeSection');
+                var singleSection = document.getElementById('singleModeSection');
+                var bulkInput = document.getElementById('bulkCreateInput');
+                
+                if (bulkToggle.checked) {
+                    bulkSection.style.display = 'block';
+                    singleSection.style.display = 'none';
+                    bulkInput.value = '1';
+                } else {
+                    bulkSection.style.display = 'none';
+                    singleSection.style.display = 'block';
+                    bulkInput.value = '0';
+                }
+            }
+            
+            function toggleSelectAll(selectAll) {
+                var checkboxes = document.querySelectorAll('.bulk-computer-checkbox');
+                checkboxes.forEach(function(cb) {
+                    cb.checked = selectAll;
+                });
+                updateSelectedCount();
+            }
+            
+            function updateSelectedCount() {
+                var checked = document.querySelectorAll('.bulk-computer-checkbox:checked').length;
+                document.getElementById('selectedCount').textContent = checked + ' selecionado(s)';
+            }
+            
+            // Inicializa contador
+            updateSelectedCount();
             </script>
         </div>
         <!-- Rodapé personalizado -->

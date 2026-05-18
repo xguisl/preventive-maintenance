@@ -123,13 +123,82 @@ if ($auto_ticket === false) {
 }
 $auto_ticket_enabled = ($auto_ticket === '1');
 
+// Obtém configuração da entidade de destino para tickets
+$ticket_entity_config = getPluginConfig('ticket_entity');
+if ($ticket_entity_config === false) {
+    $ticket_entity_config = '0';
+    updatePluginConfig('ticket_entity', $ticket_entity_config);
+}
+
+// Processa salvamento da entidade de destino
+if (isset($_POST['save_ticket_entity'])) {
+    $new_entity = isset($_POST['ticket_entity']) ? (int)$_POST['ticket_entity'] : 0;
+    updatePluginConfig('ticket_entity', (string)$new_entity);
+    $ticket_entity_config = (string)$new_entity;
+    Session::addMessageAfterRedirect(
+        __('Entidade de destino dos tickets atualizada com sucesso!'),
+        true,
+        INFO
+    );
+    Html::redirect('preventivemaintenance.php');
+}
+
+// Obtém configurações de notificação Teams
+$teams_webhook = getPluginConfig('teams_webhook');
+if ($teams_webhook === false) {
+    $teams_webhook = '';
+    updatePluginConfig('teams_webhook', $teams_webhook);
+}
+$notify_days_before = getPluginConfig('notify_days_before');
+if ($notify_days_before === false) {
+    $notify_days_before = '3';
+    updatePluginConfig('notify_days_before', $notify_days_before);
+}
+
+// Processa salvamento das configurações de notificação
+if (isset($_POST['save_notification_config'])) {
+    $new_webhook = isset($_POST['teams_webhook']) ? trim($_POST['teams_webhook']) : '';
+    $new_days = isset($_POST['notify_days_before']) ? (int)$_POST['notify_days_before'] : 3;
+    updatePluginConfig('teams_webhook', $new_webhook);
+    updatePluginConfig('notify_days_before', (string)$new_days);
+    $teams_webhook = $new_webhook;
+    $notify_days_before = (string)$new_days;
+    Session::addMessageAfterRedirect(
+        __('Configurações de notificação atualizadas com sucesso!'),
+        true,
+        INFO
+    );
+    Html::redirect('preventivemaintenance.php');
+}
+
+// Função para enviar notificação via Teams
+function sendTeamsNotification($webhook_url, $message) {
+    $payload = json_encode([
+        'text' => $message
+    ]);
+    
+    $options = [
+        'http' => [
+            'header'  => 'Content-Type: application/json',
+            'method'  => 'POST',
+            'content' => $payload
+        ]
+    ];
+    
+    $context  = stream_context_create($options);
+    $result = @file_get_contents($webhook_url, false, $context);
+    
+    return $result !== false;
+}
+
 // Inicializa filtros
 $filters = [
     'status' => 'all',
     'date_from' => '',
     'date_to' => '',
     'technician' => 0,
-    'entity' => 0
+    'entity' => 0,
+    'computer_name' => ''
 ];
 
 // Atualiza filtros da requisição
@@ -147,6 +216,9 @@ if (isset($_GET['technician'])) {
 }
 if (isset($_GET['entity'])) {
     $filters['entity'] = (int)$_GET['entity'];
+}
+if (isset($_GET['computer_name'])) {
+    $filters['computer_name'] = trim($_GET['computer_name']);
 }
 
 // Processa exclusão
@@ -199,37 +271,23 @@ function hasOpenMaintenanceTicket($computer_id, $maintenance_name) {
     }
     
     try {
-        $criteria = [
-            'SELECT' => ['id'],
-            'FROM' => 'glpi_tickets',
-            'WHERE' => [
-                'items_id' => (int)$computer_id,
-                'itemtype' => 'Computer',
-                'name' => ['LIKE', '%' . $DB->escape($maintenance_name) . '%'],
-                ['NOT' => ['status' => [Ticket::CLOSED, Ticket::SOLVED]]]
-            ],
-            'LIMIT' => 1
-        ];
+        // Busca tickets abertos (não resolvidos/fechados) associados ao computador
+        // via tabela glpi_items_tickets
+        $query = "SELECT t.id, t.name, t.status 
+                  FROM glpi_tickets t
+                  INNER JOIN glpi_items_tickets it ON it.tickets_id = t.id
+                  WHERE it.items_id = " . (int)$computer_id . "
+                  AND it.itemtype = 'Computer'
+                  AND t.name LIKE '%" . $DB->escape($maintenance_name) . "%'
+                  AND t.status NOT IN (" . Ticket::CLOSED . ", " . Ticket::SOLVED . ")
+                  LIMIT 1";
         
-        $iterator = $DB->request($criteria);
-        
-        if (count($iterator)) {
+        $result = $DB->query($query);
+        if ($result && $result->num_rows > 0) {
             return true;
         }
         
-        $criteria = [
-            'SELECT' => ['id'],
-            'FROM' => 'glpi_plugin_preventivemaintenance_tickets',
-            'WHERE' => [
-                'computer_id' => (int)$computer_id,
-                'maintenance_name' => $maintenance_name
-            ],
-            'LIMIT' => 1
-        ];
-        
-        $iterator = $DB->request($criteria);
-        
-        return count($iterator) > 0;
+        return false;
     } catch (Exception $e) {
         Toolbox::logError("Erro ao verificar tickets existentes: " . $e->getMessage());
         return false;
@@ -365,17 +423,52 @@ function cleanResolvedMaintenanceTickets() {
 
 // Função para criar ticket
 function createMaintenanceTicket($computer_id, $maintenance_name, $technician_id) {
+    global $ticket_entity_config;
+    
     if (hasOpenMaintenanceTicket($computer_id, $maintenance_name)) {
         return false;
     }
     
     $ticket = new Ticket();
     
+    // Busca o nome do computador para incluir no título
+    $computer = new Computer();
+    $computer_name = '';
+    if ($computer->getFromDB($computer_id)) {
+        $computer_name = $computer->getName();
+    }
+    
+    // Busca a descrição da manutenção e o usuário criador
+    global $DB;
+    $maintenance_description = '';
+    $created_by_user_id = Session::getLoginUserID(); // Default to current user
+    $maintenance_query = "SELECT description, created_by FROM glpi_plugin_preventivemaintenance_preventivemaintenances 
+                          WHERE items_id = " . (int)$computer_id . " AND name = '" . $DB->escape($maintenance_name) . "' LIMIT 1";
+    $maintenance_result = $DB->query($maintenance_query);
+    if ($maintenance_result && $maintenance_result->num_rows > 0) {
+        $maintenance_data = $maintenance_result->fetch_assoc();
+        $maintenance_description = $maintenance_data['description'] ?? '';
+        $created_by_user_id = (int)($maintenance_data['created_by'] ?? Session::getLoginUserID());
+    }
+    
+    // Busca a categoria "Manutenção Preventiva"
+    $category = new ITILCategory();
+    $category_id = 0;
+    $categories = $category->find(['name' => 'Manutenção Preventiva']);
+    if (count($categories) > 0) {
+        $category_data = current($categories);
+        $category_id = $category_data['id'];
+    }
+    
+    // Monta o conteúdo do ticket com a descrição
+    $content = sprintf('O computador %s requer manutenção preventiva para: %s', $computer_name, $maintenance_name);
+    if (!empty($maintenance_description)) {
+        $content .= "<br><br><strong>" . __('Descrição:') . "</strong><br>" . nl2br(htmlspecialchars($maintenance_description));
+    }
+    
     $input = [
-        'name' => sprintf(__('Preventive maintenance required: %s'), $maintenance_name),
-        'content' => sprintf(__('Computer requires preventive maintenance for: %s'), $maintenance_name),
-        'items_id' => (int)$computer_id,
-        'itemtype' => 'Computer',
+        'name' => sprintf('🔧 Manutenção Preventiva: %s - %s', $computer_name, $maintenance_name),
+        'content' => $content,
         'type' => Ticket::INCIDENT_TYPE,
         'status' => Ticket::INCOMING,
         'urgency' => 5,
@@ -383,9 +476,15 @@ function createMaintenanceTicket($computer_id, $maintenance_name, $technician_id
         'priority' => 5,
         'requesttypes_id' => 1,
         'users_id_recipient' => Session::getLoginUserID(),
-        'entities_id' => $_SESSION['glpiactive_entity'],
+        'users_id_requester' => $created_by_user_id,
+        'entities_id' => (int)$ticket_entity_config,
         'date' => date('Y-m-d H:i:s')
     ];
+    
+    // Adiciona a categoria se encontrada
+    if ($category_id > 0) {
+        $input['itilcategories_id'] = $category_id;
+    }
     
     if (!empty($technician_id)) {
         $input['_observers']['_users_id_observer'] = [(int)$technician_id];
@@ -394,6 +493,14 @@ function createMaintenanceTicket($computer_id, $maintenance_name, $technician_id
     try {
         $ticket_id = $ticket->add($input);
         if ($ticket_id) {
+            // Associa o computador ao ticket usando Item_Ticket
+            $item_ticket = new Item_Ticket();
+            $item_ticket->add([
+                'tickets_id' => $ticket_id,
+                'itemtype' => 'Computer',
+                'items_id' => (int)$computer_id
+            ]);
+            
             registerMaintenanceTicket($ticket_id, $computer_id, $maintenance_name);
             return $ticket_id;
         }
@@ -407,9 +514,11 @@ function createMaintenanceTicket($computer_id, $maintenance_name, $technician_id
 // Limpa tickets resolvidos
 cleanResolvedMaintenanceTickets();
 
-// Cria tickets automáticos se habilitado
+// Cria tickets automáticos e envia notificações se habilitado
 if ($auto_ticket_enabled) {
     $all_maintenances = $pm->find([], 'next_maintenance_date ASC');
+    $notify_days = (int)$notify_days_before;
+    $notify_seconds = $notify_days * 86400;
     
     foreach ($all_maintenances as $item) {
         if (!empty($item['last_maintenance_date']) && !empty($item['next_maintenance_date'])) {
@@ -423,19 +532,46 @@ if ($auto_ticket_enabled) {
             if ($total_days > 0) {
                 $percent = min(100, max(0, round(($elapsed_days / $total_days) * 100)));
                 
-                if ($percent >= 99) {
-                    $ticket_id = createMaintenanceTicket(
-                        $item['items_id'],
-                        $item['name'],
-                        $item['technician_id']
-                    );
+                // Notificação Teams: X dias antes da próxima manutenção
+                if (!empty($teams_webhook) && $notify_days > 0) {
+                    $days_until_next = floor(($next - $now) / 86400);
+                    $notified_key = 'teams_notified_' . $item['id'] . '_' . date('Ymd', $next);
+                    $already_notified = getPluginConfig($notified_key);
                     
-                    if ($ticket_id) {
-                        Session::addMessageAfterRedirect(
-                            sprintf(__('Ticket criado automaticamente para manutenção preventiva: %s'), $item['name']),
-                            true,
-                            INFO
+                    if ($days_until_next <= $notify_days && $days_until_next >= 0 && $already_notified === false) {
+                        $computer = new Computer();
+                        $computer_name = $computer->getFromDB($item['items_id']) ? $computer->getName() : 'N/A';
+                        $technician_name = isset($technicians_data[$item['technician_id']]) ? $technicians_data[$item['technician_id']] : '-';
+                        
+                        $msg = "⚠️ **Manutenção Preventiva se aproximando!**\n";
+                        $msg .= "📋 **Manutenção:** {$item['name']}\n";
+                        $msg .= "💻 **Computador:** {$computer_name}\n";
+                        $msg .= "🔧 **Técnico:** {$technician_name}\n";
+                        $msg .= "📅 **Próxima manutenção:** {$item['next_maintenance_date']}\n";
+                        $msg .= "⏰ **Dias restantes:** {$days_until_next} dia(s)";
+                        
+                        sendTeamsNotification($teams_webhook, $msg);
+                        updatePluginConfig($notified_key, '1');
+                    }
+                }
+                
+                if ($percent >= 99) {
+                    $has_open = hasOpenMaintenanceTicket($item['items_id'], $item['name']);
+                    
+                    if (!$has_open) {
+                        $ticket_id = createMaintenanceTicket(
+                            $item['items_id'],
+                            $item['name'],
+                            $item['technician_id']
                         );
+                        
+                        if ($ticket_id) {
+                            Session::addMessageAfterRedirect(
+                                sprintf(__('Ticket criado automaticamente para manutenção preventiva: %s'), $item['name']),
+                                true,
+                                INFO
+                            );
+                        }
                     }
                 }
             }
@@ -466,6 +602,21 @@ if (!empty($filters['date_from']) || !empty($filters['date_to'])) {
 
 // Busca itens
 $all_items = $pm->find($criteria, 'entities_id, next_maintenance_date ASC');
+
+// Aplica filtro por nome do computador se especificado
+if (!empty($filters['computer_name'])) {
+    $computer = new Computer();
+    $matching_computers = $computer->find(['name' => ['LIKE', '%' . $filters['computer_name'] . '%']]);
+    $matching_ids = array_keys($matching_computers);
+    
+    if (!empty($matching_ids)) {
+        $all_items = array_filter($all_items, function($item) use ($matching_ids) {
+            return in_array($item['items_id'], $matching_ids);
+        });
+    } else {
+        $all_items = [];
+    }
+}
 
 // Obtém lista de técnicos cadastrados nas manutenções
 $technicians_in_maintenance = [];
@@ -880,7 +1031,56 @@ Html::header(
                     <span class="toggle-knob"></span>
                 </a>
             </div>
+            
+            <form method="post" style="display: flex; align-items: center; gap: 8px; margin-left: 10px;">
+                <?php echo Html::hidden('_glpi_csrf_token', ['value' => Session::getNewCSRFToken()]); ?>
+                <span class="toggle-label"><?= __('Entidade Ticket') ?>:</span>
+                <select name="ticket_entity" class="form-select form-select-sm" style="width: auto; min-width: 150px;">
+                    <?php
+                    $entity_query = "SELECT id, completename FROM glpi_entities ORDER BY completename ASC";
+                    $entity_result = $DB->query($entity_query);
+                    if ($entity_result) {
+                        while ($ent_row = $entity_result->fetch_assoc()) {
+                            $selected = ((int)$ticket_entity_config == $ent_row['id']) ? 'selected' : '';
+                            echo "<option value='{$ent_row['id']}' $selected>{$ent_row['completename']}</option>";
+                        }
+                    }
+                    ?>
+                </select>
+                <button type="submit" name="save_ticket_entity" value="1" class="btn btn-sm btn-outline-success">
+                    <i class="fas fa-save"></i>
+                </button>
+            </form>
+            
+            <button id="toggleNotifConfig" class="btn btn-sm btn-outline-warning" style="margin-left: 10px;" title="Configurar Notificações">
+                <i class="fas fa-bell"></i>
+            </button>
         </div>
+    </div>
+
+    <!-- Painel de Configuração de Notificações -->
+    <div id="notifConfigPanel" style="display: none; margin-bottom: 20px; padding: 20px; background: #fff8e1; border: 2px solid #ffc107; border-radius: 8px;">
+        <h5 style="margin-bottom: 15px;"><i class="fas fa-bell" style="margin-right: 8px;"></i><?= __('Notificações Microsoft Teams') ?></h5>
+        <form method="post" style="display: flex; flex-wrap: wrap; align-items: flex-end; gap: 15px;">
+            <?php echo Html::hidden('_glpi_csrf_token', ['value' => Session::getNewCSRFToken()]); ?>
+            <div style="flex: 1; min-width: 300px;">
+                <label class="form-label"><strong>Webhook URL do Teams</strong></label>
+                <input type="url" name="teams_webhook" class="form-control form-control-sm" 
+                       value="<?= htmlspecialchars($teams_webhook) ?>" 
+                       placeholder="https://outlook.office.com/webhook/...">
+            </div>
+            <div style="width: 120px;">
+                <label class="form-label"><strong>Dias antes</strong></label>
+                <input type="number" name="notify_days_before" class="form-control form-control-sm" 
+                       value="<?= (int)$notify_days_before ?>" min="1" max="30">
+            </div>
+            <button type="submit" name="save_notification_config" value="1" class="btn btn-sm btn-success">
+                <i class="fas fa-save"></i> Salvar
+            </button>
+        </form>
+        <small class="text-muted" style="display: block; margin-top: 8px;">
+            Para criar o webhook: Teams > Canal > (...) > Conectores > Webhook de Entrada > Configurar
+        </small>
     </div>
 
     <div id="advancedFilters" class="advanced-filters" style="<?= isset($_GET['filter_applied']) ? '' : 'display: none;' ?>">
@@ -935,6 +1135,11 @@ Html::header(
                     ];
                     echo Entity::dropdown($entity_options);
                     ?>
+                </div>
+                
+                <div class="filter-group">
+                    <div class="filter-title"><?= __('Nome do Computador') ?></div>
+                    <input type="text" name="computer_name" class="form-control" value="<?= htmlspecialchars($filters['computer_name']) ?>" placeholder="Buscar por nome...">
                 </div>
             </div>
             
@@ -1043,18 +1248,13 @@ Html::header(
                         </tbody>
                     </table>
                 </div>
-            </div>
-        <?php endforeach; ?>
-    <?php endif; ?>
+            <?php endforeach; ?>
+        <?php endif; ?>
 
     <div class="custom-footer">
-        <i class="fas fa-code"></i> <?= __('Developed by WIDA - Work Information Developments and Analytics') ?>
+            <i class="fas fa-code"></i> <?= __('Developed by WIDA - Work Information Develops and Analytics') ?>
+        </div>
     </div>
-</div>
-
-<!-- Donation Button and QR Code -->
-<div class="donation-button" id="donationButton">
-    <i class="fas fa-heart"></i>
 </div>
 
 <div class="donation-qr-container" id="donationQrContainer">
@@ -1083,6 +1283,22 @@ Html::header(
 document.addEventListener('DOMContentLoaded', function() {
     const toggleFiltersBtn = document.getElementById('toggleFilters');
     const advancedFilters = document.getElementById('advancedFilters');
+    const toggleNotifConfig = document.getElementById('toggleNotifConfig');
+    const notifConfigPanel = document.getElementById('notifConfigPanel');
+    
+    if (toggleNotifConfig) {
+        toggleNotifConfig.addEventListener('click', function() {
+            if (notifConfigPanel.style.display === 'none') {
+                notifConfigPanel.style.display = 'block';
+                toggleNotifConfig.classList.remove('btn-outline-warning');
+                toggleNotifConfig.classList.add('btn-warning');
+            } else {
+                notifConfigPanel.style.display = 'none';
+                toggleNotifConfig.classList.remove('btn-warning');
+                toggleNotifConfig.classList.add('btn-outline-warning');
+            }
+        });
+    }
     
     toggleFiltersBtn.addEventListener('click', function() {
         if (advancedFilters.style.display === 'none') {
