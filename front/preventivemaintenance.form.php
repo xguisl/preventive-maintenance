@@ -170,6 +170,19 @@ if (isset($_POST['add'])) {
                     continue;
                 }
                 
+                // Se o nome não for preenchido, usa o nome do usuário atrelado à máquina
+                // If name is empty, uses the computer's assigned user name
+                $maintenance_name = $_POST['name'] ?? '';
+                if (empty($maintenance_name)) {
+                    $comp_user_id = $computer->fields['users_id'] ?? 0;
+                    if ($comp_user_id > 0) {
+                        $comp_user = new User();
+                        if ($comp_user->getFromDB($comp_user_id)) {
+                            $maintenance_name = $comp_user->getName();
+                        }
+                    }
+                }
+                
                 // Calcula intervalo
                 $maintenance_interval = 30;
                 $last_date = !empty($_POST['last_maintenance_date']) ? $_POST['last_maintenance_date'] : null;
@@ -184,7 +197,7 @@ if (isset($_POST['add'])) {
                          (name, entities_id, is_recursive, technician_id, items_id, itemtype, 
                           last_maintenance_date, next_maintenance_date, description, maintenance_interval, created_by)
                           VALUES (
-                          '".$DB->escape($_POST['name'] ?? '')."',
+                          '".$DB->escape($maintenance_name)."',
                           ".(int)$selected_entity_id.",
                           0,
                           ".(int)($_POST['technician_id'] ?? 0).",
@@ -249,8 +262,22 @@ if (isset($_POST['add'])) {
 
         // Prepara os dados para gravação
         // Prepares data for saving
+        $maintenance_name = $_POST['name'] ?? '';
+        
+        // Se o nome não for preenchido, usa o nome do usuário atrelado à máquina
+        // If name is empty, uses the computer's assigned user name
+        if (empty($maintenance_name)) {
+            $comp_user_id = $computer->fields['users_id'] ?? 0;
+            if ($comp_user_id > 0) {
+                $comp_user = new User();
+                if ($comp_user->getFromDB($comp_user_id)) {
+                    $maintenance_name = $comp_user->getName();
+                }
+            }
+        }
+        
         $input = [
-            'name' => $_POST['name'] ?? '',
+            'name' => $maintenance_name,
             'entities_id' => $selected_entity_id,
             'is_recursive' => 0,
             'technician_id' => (int)$_POST['technician_id'],
@@ -279,6 +306,24 @@ if (isset($_POST['add'])) {
         if ($is_edit) {
             $input['id'] = $id;
             
+            // Se o nome não for preenchido, usa o nome do usuário atrelado à máquina
+            // If name is empty, uses the computer's assigned user name
+            if (empty($_POST['name'])) {
+                $edit_computer = new Computer();
+                if ($edit_computer->getFromDB($input['items_id'])) {
+                    $comp_user_id = $edit_computer->fields['users_id'] ?? 0;
+                    if ($comp_user_id > 0) {
+                        $comp_user = new User();
+                        if ($comp_user->getFromDB($comp_user_id)) {
+                            $input['name'] = $comp_user->getName();
+                        }
+                    }
+                }
+            }
+            
+            error_log("[DEBUG UPDATE] Dados recebidos: " . print_r($_POST, true));
+            error_log("[DEBUG UPDATE] Input preparado: " . print_r($input, true));
+            
             // Atualização manual
             // Manual update
             $query = "UPDATE glpi_plugin_preventivemaintenance_preventivemaintenances SET
@@ -301,6 +346,7 @@ if (isset($_POST['add'])) {
             if (!$result) {
                 $db_error = $DB->error();
                 error_log("[ERRO] Query falhou: " . $db_error);
+                error_log("[ERRO] MySQL error number: " . $DB->errno());
                 throw new Exception(__('Erro ao atualizar no banco de dados: ') . $db_error);
             }
             
@@ -638,9 +684,10 @@ Html::header(
                 </div>
                     
                     <div class='form-section'>
-                        <label for='name'><?php echo __('Nome da Manutenção'); ?> <span class='required'>*</span></label>
+                        <label for='name'><?php echo __('Nome da Manutenção'); ?></label>
                         <input type='text' name='name' id='name' class='form-control' 
-                               value="<?php echo $is_edit ? htmlspecialchars($item_data['name']) : ''; ?>" required>
+                               value="<?php echo $is_edit ? htmlspecialchars($item_data['name']) : ''; ?>" 
+                               placeholder="<?php echo __('Se não preenchido, será usado o nome do usuário da máquina'); ?>">
                     </div>
                     
                     <div class='form-section'>
@@ -656,18 +703,17 @@ Html::header(
                         </select>
                     </div>
                     
-                    <?php if ($is_edit): ?>
+                    <?php if ($is_edit): 
+                        $edit_computer = new Computer();
+                        $edit_computer_name = '';
+                        if ($edit_computer->getFromDB($item_data['items_id'])) {
+                            $edit_computer_name = $edit_computer->getName();
+                        }
+                    ?>
                     <div class='form-section'>
-                        <label for='items_id'><?php echo __('Computador'); ?> <span class='required'>*</span></label>
-                        <select name='items_id' id='items_id' class='form-select' required>
-                            <option value=''><?php echo __('Selecione um computador'); ?></option>
-                            <?php 
-                            foreach ($available_computers as $comp) {
-                                $selected = ($comp['id'] == $item_data['items_id']) ? 'selected' : '';
-                                echo "<option value='{$comp['id']}' {$selected}>" . htmlspecialchars($comp['name']) . "</option>";
-                            }
-                            ?>
-                        </select>
+                        <label><?php echo __('Computador'); ?></label>
+                        <input type='text' class='form-control' value="<?php echo htmlspecialchars($edit_computer_name); ?>" readonly disabled>
+                        <input type='hidden' name='items_id' value="<?php echo (int)$item_data['items_id']; ?>">
                     </div>
                     <?php else: ?>
                     <div class='form-section'>
