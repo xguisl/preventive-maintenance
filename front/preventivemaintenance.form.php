@@ -662,8 +662,10 @@ Html::header(
                         <select name='items_id' id='items_id' class='form-select' required>
                             <option value=''><?php echo __('Selecione um computador'); ?></option>
                             <?php 
-                            $computer->getFromDB($item_data['items_id']);
-                            echo "<option value='{$item_data['items_id']}' selected>{$computer->getName()}</option>";
+                            foreach ($available_computers as $comp) {
+                                $selected = ($comp['id'] == $item_data['items_id']) ? 'selected' : '';
+                                echo "<option value='{$comp['id']}' {$selected}>" . htmlspecialchars($comp['name']) . "</option>";
+                            }
                             ?>
                         </select>
                     </div>

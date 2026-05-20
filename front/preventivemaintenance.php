@@ -242,6 +242,39 @@ if (isset($_GET['delete'])) {
     }
 }
 
+// Processa exclusão em lote
+if (isset($_POST['bulk_delete']) && isset($_POST['selected_items']) && is_array($_POST['selected_items'])) {
+    if ($pm->canDelete()) {
+        $selected_ids = array_map('intval', $_POST['selected_items']);
+        $success_count = 0;
+        $error_count = 0;
+        
+        foreach ($selected_ids as $id) {
+            if ($id > 0 && $pm->delete(['id' => $id])) {
+                $success_count++;
+            } else {
+                $error_count++;
+            }
+        }
+        
+        if ($success_count > 0) {
+            Session::addMessageAfterRedirect(
+                sprintf(__('%d registros apagados com sucesso!'), $success_count),
+                true,
+                INFO
+            );
+        }
+        if ($error_count > 0) {
+            Session::addMessageAfterRedirect(
+                sprintf(__('%d registros falharam ao apagar.'), $error_count),
+                false,
+                ERROR
+            );
+        }
+        Html::redirect('preventivemaintenance.php');
+    }
+}
+
 // Processa toggle do Auto Ticket
 if (isset($_GET['toggle_auto_ticket'])) {
     $new_value = $auto_ticket_enabled ? '0' : '1';
@@ -1159,6 +1192,17 @@ Html::header(
             <i class="fas fa-exclamation-triangle"></i> <?= __('Nenhum registro encontrado.') ?>
         </div>
     <?php else: ?>
+        <?php if ($pm->canDelete()): ?>
+        <form method="post" id="bulkDeleteForm">
+            <?php echo Html::hidden('_glpi_csrf_token', ['value' => Session::getNewCSRFToken()]); ?>
+            <input type="hidden" name="bulk_delete" value="1">
+            <div style="margin-bottom: 15px; text-align: right;">
+                <button type="submit" class="btn btn-danger" onclick="return confirm('<?= __('Deseja realmente excluir os registros selecionados?') ?>');">
+                    <i class="fas fa-trash"></i> <?= __('Excluir Selecionados') ?>
+                </button>
+            </div>
+        <?php endif; ?>
+        
         <?php foreach ($items_by_entity as $entity): ?>
             <?php if (empty($entity['items'])) continue; ?>
             
@@ -1171,6 +1215,11 @@ Html::header(
                     <table class="table table-hover">
                         <thead>
                             <tr>
+                                <?php if ($pm->canDelete()): ?>
+                                <th style="text-align: center; width: 50px;">
+                                    <input type="checkbox" id="selectAllCheckbox" onchange="toggleAllCheckboxes(this)">
+                                </th>
+                                <?php endif; ?>
                                 <th style="text-align: center"><?= __('ID') ?></th>
                                 <th style="text-align: center"><?= __('Nome/descr.') ?></th>
                                 <th style="text-align: center"><?= __('Computer') ?></th>
@@ -1219,6 +1268,11 @@ Html::header(
                                 }
                                 ?>
                                 <tr>
+                                    <?php if ($pm->canDelete()): ?>
+                                    <td style="text-align: center">
+                                        <input type="checkbox" name="selected_items[]" value="<?= $item['id'] ?>" class="item-checkbox">
+                                    </td>
+                                    <?php endif; ?>
                                     <td style="text-align: center"><?= $item['id'] ?></td>
                                     <td style="text-align: center"><?= $item['name'] ?></td>
                                     <td style="text-align: center"><?= $computer_name ?></td>
@@ -1249,6 +1303,10 @@ Html::header(
                     </table>
                 </div>
             <?php endforeach; ?>
+        
+        <?php if ($pm->canDelete()): ?>
+        </form>
+        <?php endif; ?>
         <?php endif; ?>
 
     <div class="custom-footer">
@@ -1280,6 +1338,13 @@ Html::header(
 </div>
 
 <script>
+function toggleAllCheckboxes(source) {
+    const checkboxes = document.querySelectorAll('.item-checkbox');
+    checkboxes.forEach(checkbox => {
+        checkbox.checked = source.checked;
+    });
+}
+
 document.addEventListener('DOMContentLoaded', function() {
     const toggleFiltersBtn = document.getElementById('toggleFilters');
     const advancedFilters = document.getElementById('advancedFilters');
